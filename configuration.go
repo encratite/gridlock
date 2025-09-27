@@ -70,6 +70,15 @@ func (r *RaceConfiguration) validate() {
 	if !r.Practice.Before(r.Qualifying.Time) || !r.Qualifying.Before(r.Race.Time) {
 		log.Fatalf("Invalid times in race configuration: %s", r.Path)
 	}
+	limit := time.Duration(32) * time.Hour
+	delta := r.Qualifying.Sub(r.Practice.Time)
+	if delta > limit {
+		log.Fatalf("Erroneous practice or qualifying time with a delta of %.1f hours: %s", delta.Hours(), r.Path)
+	}
+	delta = r.Race.Sub(r.Qualifying.Time)
+	if delta > limit {
+		log.Fatalf("Erroneous qualifying or race time with a delta of %.1f hours: %s", delta.Hours(), r.Path)
+	}
 }
 
 func (d *SerializableTime) UnmarshalYAML(value *yaml.Node) error {
