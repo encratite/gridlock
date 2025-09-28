@@ -66,17 +66,17 @@ func runBacktest() {
 	}
 	stratTypes := []strategyType{
 		strategyPractice,
-		// strategyQualifying,
-		// strategyRace,
+		strategyQualifying,
+		strategyRace,
 	}
 	betConfigurations := [][]strategyBet{
+		/*
 		{
 			{
 				position: 1,
 				yes: false,
 			},
 		},
-		/*
 		{
 			{
 				position: 2,
@@ -108,6 +108,7 @@ func runBacktest() {
 			},
 		},
 		*/
+		/*
 		{
 			{
 				position: 2,
@@ -120,8 +121,33 @@ func runBacktest() {
 		},
 		{
 			{
+				position: 2,
+				yes: true,
+			},
+			{
+				position: 3,
+				yes: true,
+			},
+			{
+				position: 4,
+				yes: true,
+			},
+		},
+		{
+			{
 				position: 1,
-				yes: false,
+				yes: true,
+			},
+			{
+				position: 2,
+				yes: true,
+			},
+		},
+		*/
+		{
+			{
+				position: 1,
+				yes: true,
 			},
 			{
 				position: 2,
@@ -129,6 +155,10 @@ func runBacktest() {
 			},
 			{
 				position: 3,
+				yes: true,
+			},
+			{
+				position: 4,
 				yes: true,
 			},
 		},
