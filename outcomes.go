@@ -43,6 +43,7 @@ func newBinGroup(name string) priceBinGroup {
 		newPriceBin(0.05, 0.10),
 		newPriceBin(0.10, 0.20),
 		newPriceBin(0.20, 0.30),
+		newPriceBin(0.20, 0.40),
 		newPriceBin(0.40, 1.00),
 	}
 	return priceBinGroup{
