@@ -3,15 +3,14 @@ package main
 import (
 	"fmt"
 	"log"
+	"math"
 	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/antchfx/htmlquery"
 	"github.com/encratite/commons"
-	"github.com/sjwhitworth/golearn/base"
-	"github.com/sjwhitworth/golearn/linear_models"
-	"github.com/sjwhitworth/golearn/evaluation"
+	"github.com/cdipaolo/goml/linear"
 )
 
 const (
@@ -20,21 +19,9 @@ const (
 	firstSeason = 2020
 	lastSeason = 2025
 	lastEventId = 17
-	featureRaces = 3
+	featureRaces = 5
+	featurePositionScoreBase = 0.4
 )
-
-var featurePositionScores = []int{
-	25,
-	18,
-	15,
-	12,
-	10,
-	8,
-	6,
-	4,
-	2,
-	1,
-}
 
 type raceResult int
 
@@ -65,8 +52,8 @@ type driverRaceResult struct {
 func performRegression() {
 	paths := downloadFiles()
 	drivers := parseFiles(paths)
-	features := getFeatures(drivers)
-	fitAndEvaluate(features)
+	features, labels := getFeatures(drivers)
+	fitAndEvaluate(features, labels)
 }
 
 func downloadFiles() []wikiDataPath {
@@ -201,76 +188,92 @@ func parseFile(dataPath wikiDataPath) []driverSeasonalData {
 	return drivers
 }
 
-func getFeatures(drivers []driverSeasonalData) *base.DenseInstances {
+func getFeatures(drivers []driverSeasonalData) ([][]float64, []float64) {
 	features := [][]float64{}
-	labels := []bool{}
+	labels := []float64{}
 	for _, driver := range drivers {
 		for i, race := range driver.races {
 			if i < featureRaces {
 				continue
 			}
 			raceFeatures := []float64{}
-			for j := 1; j <= featureRaces; j++ {
+			multiSeason := false
+			j := 1
+			for len(raceFeatures) < featureRaces && i >= j {
 				previousRace := driver.races[i - j]
-				value := 0
-				if previousRace.result == resultPosition {
-					positionIndex := previousRace.position - 1
-					if positionIndex < len(featurePositionScores) {
-						value = featurePositionScores[positionIndex]
-					}
+				if previousRace.season != race.season {
+					multiSeason = true
+					break
 				}
-				raceFeatures = append(raceFeatures, float64(value))
+				if previousRace.result == resultPosition {
+					exponent := float64(previousRace.position - 1)
+					value := math.Pow(featurePositionScoreBase, exponent)
+					raceFeatures = append(raceFeatures, value)
+				}
+				j++
 			}
-			label := race.result == resultPosition && race.position == 1
+			if multiSeason {
+				continue
+			}
+			if len(raceFeatures) != featureRaces {
+				continue
+			}
+			var label float64
+			if race.result == resultPosition && race.position == 1 {
+				label = 1.0
+			} else {
+				label = 0.0
+			}
 			labels = append(labels, label)
 			features = append(features, raceFeatures)
 		}
 	}
-	if len(features) != len(labels) {
-		log.Fatalf("Invalid number of features or labels: %d features vs. %d labels", len(features), len(labels))
-	}
-	data := base.NewDenseInstances()
-	raceSpecs := []base.AttributeSpec{}
-	for i := range featureRaces {
-		name := fmt.Sprintf("race%d", i + 1)
-		attribute := base.NewFloatAttribute(name)
-		spec := data.AddAttribute(attribute)
-		raceSpecs = append(raceSpecs, spec)
-	}
-	winnerAttribute := base.NewBinaryAttribute("winner")
-	winnerSpec := data.AddAttribute(winnerAttribute)
-	data.AddClassAttribute(winnerAttribute)
-	data.Extend(len(features))
-	for row, currentFeatures := range features {
-		for j := range currentFeatures {
-			raceSpec := raceSpecs[j]
-			feature := currentFeatures[j]
-			data.Set(raceSpec, row, base.PackFloatToBytes(feature))
-		}
-		var label byte
-		if labels[row] {
-			label = 1
-		} else {
-			label = 0
-		}
-		data.Set(winnerSpec, row, []byte{label})
-	}
-	return data
+	return features, labels
 }
 
-func fitAndEvaluate(data *base.DenseInstances) {
-	regression, err := linear_models.NewLogisticRegression("l2", 1.0, 1e-4)
+func fitAndEvaluate(features [][]float64, labels []float64) {
+	model := linear.NewLogistic("Batch Gradient Ascent", 0.0001, 0.0, 1000, features, labels)
+	err := model.Learn()
 	if err != nil {
-		log.Fatalf("Failed to create logistic regression object: %v", err)
+		log.Fatalf("Failed to train model: %v", err)
 	}
-	regression.Fit(data)
-	predictions, err := regression.Predict(data)
-	if err != nil {
-		log.Fatalf("Failed to create predictions: %v", err)
+	truePositives := 0
+	falsePositives := 0
+	trueNegatives := 0
+	falseNegatives := 0
+	positiveLabels := 0
+	for i, currentFeatures := range features {
+		label := labels[i] == 1.0
+		predictionVector, err := model.Predict(currentFeatures)
+		if err != nil {
+			log.Fatalf("Failed to make predictions: %v", err)
+		}
+		prediction := predictionVector[0] > 0.5
+		if label {
+			if prediction {
+				truePositives++
+			} else {
+				falseNegatives++
+			}
+			positiveLabels++
+		} else {
+			if prediction {
+				falsePositives++
+			} else {
+				trueNegatives++
+			}
+		}
 	}
-	confusion, err := evaluation.GetConfusionMatrix(data, predictions)
-	if err != nil {
-		log.Fatalf("Failed to calculate confusion matrix: %v", err)
+	total := len(features)
+	printRatio := func (description string, count int) {
+		percentage := 100.0 * float64(count) / float64(total)
+		fmt.Printf("%s: %.1f%% (%d samples)\n", description, percentage, count)
 	}
-	fmt.Println(evaluation.GetSummary(confusion))
+	f1Score := 2.0 * float64(truePositives) / (2.0 * float64(truePositives) + float64(falsePositives) + float64(falseNegatives))
+	printRatio("True positives", truePositives)
+	printRatio("True negatives", trueNegatives)
+	printRatio("False positives", falsePositives)
+	printRatio("False negatives", falseNegatives)
+	printRatio("True labels", positiveLabels)
+	fmt.Printf("F1 score: %.3f", f1Score)
 }
