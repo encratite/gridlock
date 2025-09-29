@@ -4,16 +4,37 @@ import (
 	"fmt"
 	"log"
 	"path/filepath"
+	"slices"
 	"strings"
 
 	"github.com/antchfx/htmlquery"
 	"github.com/encratite/commons"
+	"github.com/sjwhitworth/golearn/base"
+	"github.com/sjwhitworth/golearn/linear_models"
+	"github.com/sjwhitworth/golearn/evaluation"
 )
 
 const (
 	dataDirectory = "data"
 	driverLimit = 10
+	firstSeason = 2020
+	lastSeason = 2025
+	lastEventId = 17
+	featureRaces = 3
 )
+
+var featurePositionScores = []int{
+	25,
+	18,
+	15,
+	12,
+	10,
+	8,
+	6,
+	4,
+	2,
+	1,
+}
 
 type raceResult int
 
@@ -43,13 +64,15 @@ type driverRaceResult struct {
 
 func performRegression() {
 	paths := downloadFiles()
-	_ = parseFiles(paths)
+	drivers := parseFiles(paths)
+	features := getFeatures(drivers)
+	fitAndEvaluate(features)
 }
 
 func downloadFiles() []wikiDataPath {
 	commons.CreateDirectory(dataDirectory)
 	paths := []wikiDataPath{}
-	for year := 2020; year <= 2025; year++ {
+	for year := firstSeason; year <= lastSeason; year++ {
 		fileName := fmt.Sprintf("%d.html", year)
 		outputPath := filepath.Join(dataDirectory, fileName)
 		dataPath := wikiDataPath{
@@ -71,11 +94,22 @@ func downloadFiles() []wikiDataPath {
 }
 
 func parseFiles(paths []wikiDataPath) []driverSeasonalData {
+	drivers := []driverSeasonalData{}
 	for _, path := range paths {
-		_ = parseFile(path)
-		break
+		seasonDrivers := parseFile(path)
+		for _, driver := range seasonDrivers {
+			i := slices.IndexFunc(drivers, func (d driverSeasonalData) bool {
+				return d.name == driver.name
+			})
+			if i >= 0 {
+				races := &drivers[i].races
+				*races = append(*races, driver.races...)
+			} else {
+				drivers = append(drivers, driver)
+			}
+		}
 	}
-	return nil
+	return drivers
 }
 
 func parseFile(dataPath wikiDataPath) []driverSeasonalData {
@@ -106,6 +140,7 @@ func parseFile(dataPath wikiDataPath) []driverSeasonalData {
 		// fmt.Printf("\tEvent code: %s\n", eventCode)
 		eventCodes = append(eventCodes, eventCode)
 	}
+	drivers := []driverSeasonalData{}
 	for i := range driverLimit {
 		row := rows[i + 1]
 		nameCell := htmlquery.FindOne(row, "/td[1]")
@@ -114,13 +149,17 @@ func parseFile(dataPath wikiDataPath) []driverSeasonalData {
 		}
 		name := htmlquery.InnerText(nameCell)
 		name = commons.Trim(name)
-		fmt.Printf("\tDriver: %s\n", name)
+		// fmt.Printf("\tDriver: %s\n", name)
 		cells := htmlquery.Find(row, "/td[position() > 1 and position() < last()]/text()[1]")
 		if len(cells) < 10 {
 			log.Fatalf("Failed to find driver cells in %s", path)
 		}
-		results := []driverRaceResult{}
-		for id, cell := range cells {
+		races := []driverRaceResult{}
+		for j, cell := range cells {
+			id := j + 1
+			if dataPath.season == lastSeason && id > lastEventId {
+				break
+			}
 			resultText := htmlquery.InnerText(cell)
 			resultText = commons.Trim(resultText)
 			resultText = strings.Replace(resultText, "†", "", 1)
@@ -150,10 +189,88 @@ func parseFile(dataPath wikiDataPath) []driverSeasonalData {
 					position: 0,
 				}
 			}
-			results = append(results, driverResult)
-			fmt.Printf("\t\tResult: %s\n", resultText)
+			races = append(races, driverResult)
+			// fmt.Printf("\t\tResult: %s\n", resultText)
 		}
+		driver := driverSeasonalData{
+			name: name,
+			races: races,
+		}
+		drivers = append(drivers, driver)
 	}
-	return nil
+	return drivers
 }
 
+func getFeatures(drivers []driverSeasonalData) *base.DenseInstances {
+	features := [][]float64{}
+	labels := []bool{}
+	for _, driver := range drivers {
+		for i, race := range driver.races {
+			if i < featureRaces {
+				continue
+			}
+			raceFeatures := []float64{}
+			for j := 1; j <= featureRaces; j++ {
+				previousRace := driver.races[i - j]
+				value := 0
+				if previousRace.result == resultPosition {
+					positionIndex := previousRace.position - 1
+					if positionIndex < len(featurePositionScores) {
+						value = featurePositionScores[positionIndex]
+					}
+				}
+				raceFeatures = append(raceFeatures, float64(value))
+			}
+			label := race.result == resultPosition && race.position == 1
+			labels = append(labels, label)
+			features = append(features, raceFeatures)
+		}
+	}
+	if len(features) != len(labels) {
+		log.Fatalf("Invalid number of features or labels: %d features vs. %d labels", len(features), len(labels))
+	}
+	data := base.NewDenseInstances()
+	raceSpecs := []base.AttributeSpec{}
+	for i := range featureRaces {
+		name := fmt.Sprintf("race%d", i + 1)
+		attribute := base.NewFloatAttribute(name)
+		spec := data.AddAttribute(attribute)
+		raceSpecs = append(raceSpecs, spec)
+	}
+	winnerAttribute := base.NewBinaryAttribute("winner")
+	winnerSpec := data.AddAttribute(winnerAttribute)
+	data.AddClassAttribute(winnerAttribute)
+	data.Extend(len(features))
+	for row, currentFeatures := range features {
+		for j := range currentFeatures {
+			raceSpec := raceSpecs[j]
+			feature := currentFeatures[j]
+			data.Set(raceSpec, row, base.PackFloatToBytes(feature))
+		}
+		var label byte
+		if labels[row] {
+			label = 1
+		} else {
+			label = 0
+		}
+		data.Set(winnerSpec, row, []byte{label})
+	}
+	return data
+}
+
+func fitAndEvaluate(data *base.DenseInstances) {
+	regression, err := linear_models.NewLogisticRegression("l2", 1.0, 1e-4)
+	if err != nil {
+		log.Fatalf("Failed to create logistic regression object: %v", err)
+	}
+	regression.Fit(data)
+	predictions, err := regression.Predict(data)
+	if err != nil {
+		log.Fatalf("Failed to create predictions: %v", err)
+	}
+	confusion, err := evaluation.GetConfusionMatrix(data, predictions)
+	if err != nil {
+		log.Fatalf("Failed to calculate confusion matrix: %v", err)
+	}
+	fmt.Println(evaluation.GetSummary(confusion))
+}
