@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"log"
-	"math"
 	"path/filepath"
 	"slices"
 	"strings"
@@ -15,12 +14,11 @@ import (
 
 const (
 	dataDirectory = "data"
-	driverLimit = 10
-	firstSeason = 2020
+	driverLimit = 4
+	firstSeason = 2019
 	lastSeason = 2025
 	lastEventId = 17
-	featureRaces = 5
-	featurePositionScoreBase = 0.4
+	featureRaces = 6
 )
 
 type raceResult int
@@ -196,27 +194,54 @@ func getFeatures(drivers []driverSeasonalData) ([][]float64, []float64) {
 			if i < featureRaces {
 				continue
 			}
-			raceFeatures := []float64{}
 			multiSeason := false
-			j := 1
-			for len(raceFeatures) < featureRaces && i >= j {
+			bestPosition := 20
+			podiumFinishes := 0
+			retired := false
+			disqualified := false
+			for j := 1; j <= featureRaces; j++ {
 				previousRace := driver.races[i - j]
 				if previousRace.season != race.season {
 					multiSeason = true
 					break
 				}
-				if previousRace.result == resultPosition {
-					exponent := float64(previousRace.position - 1)
-					value := math.Pow(featurePositionScoreBase, exponent)
-					raceFeatures = append(raceFeatures, value)
+				switch previousRace.result {
+				case resultPosition:
+					position := previousRace.position
+					if position <= 3 {
+						podiumFinishes++
+					}
+					bestPosition = min(bestPosition, position)
+				case resultRetired:
+					retired = true
+				case resultDisqualified:
+					disqualified = true
 				}
-				j++
 			}
 			if multiSeason {
 				continue
 			}
-			if len(raceFeatures) != featureRaces {
-				continue
+			raceFeatures := []float64{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}
+			switch bestPosition {
+			case 1:
+				raceFeatures[0] = 1.0
+			case 2:
+				raceFeatures[1] = 1.0
+			case 3:
+				raceFeatures[2] = 1.0
+			case 4:
+				raceFeatures[3] = 1.0
+			}
+			if podiumFinishes >= 2 {
+				raceFeatures[4] = 1.0
+			} else if podiumFinishes == 1 {
+				raceFeatures[5] = 1.0
+			}
+			if retired {
+				raceFeatures[6] = 1.0
+			}
+			if disqualified {
+				raceFeatures[7] = 1.0
 			}
 			var label float64
 			if race.result == resultPosition && race.position == 1 {
@@ -232,7 +257,7 @@ func getFeatures(drivers []driverSeasonalData) ([][]float64, []float64) {
 }
 
 func fitAndEvaluate(features [][]float64, labels []float64) {
-	model := linear.NewLogistic("Batch Gradient Ascent", 0.0001, 0.0, 1000, features, labels)
+	model := linear.NewLogistic("Batch Gradient Ascent", 0.0001, 0, 1000, features, labels)
 	err := model.Learn()
 	if err != nil {
 		log.Fatalf("Failed to train model: %v", err)
