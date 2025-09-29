@@ -1,24 +1,33 @@
 package main
 
 import (
+	"cmp"
 	"fmt"
+	"io"
 	"log"
 	"path/filepath"
 	"slices"
 	"strings"
 
 	"github.com/antchfx/htmlquery"
-	"github.com/encratite/commons"
 	"github.com/cdipaolo/goml/linear"
+	"github.com/encratite/commons"
 )
 
 const (
 	dataDirectory = "data"
-	driverLimit = 4
-	firstSeason = 2019
+	firstSeason = 2020
 	lastSeason = 2025
 	lastEventId = 17
-	featureRaces = 6
+	driverLimit = 6
+	minSeasonRaces = 5
+	classThreshold = 0.31
+	logisticMethod = "Batch Gradient Ascent"
+	alpha = 0.0001
+	regularization = 0
+	maxIterations = 1000
+	predictionsSeason = 2025
+	predictionsId = minSeasonRaces + 1
 )
 
 type raceResult int
@@ -45,13 +54,27 @@ type driverRaceResult struct {
 	id int
 	result raceResult
 	position int
+	pole bool
+}
+
+type featureMetaData struct {
+	driver string
+	season int
+	id int
+}
+
+type driverPredictionData struct {
+	features []float64
+	label float64
+	metaData featureMetaData
 }
 
 func performRegression() {
 	paths := downloadFiles()
 	drivers := parseFiles(paths)
-	features, labels := getFeatures(drivers)
-	fitAndEvaluate(features, labels)
+	features, labels, metaData := getFeatures(drivers)
+	// fitAndEvaluate(features, labels)
+	makePredictions(features, labels, metaData)
 }
 
 func downloadFiles() []wikiDataPath {
@@ -122,7 +145,6 @@ func parseFile(dataPath wikiDataPath) []driverSeasonalData {
 	eventCodes := []string{}
 	for _, link := range links {
 		eventCode := htmlquery.InnerText(link)
-		// fmt.Printf("\tEvent code: %s\n", eventCode)
 		eventCodes = append(eventCodes, eventCode)
 	}
 	drivers := []driverSeasonalData{}
@@ -134,8 +156,7 @@ func parseFile(dataPath wikiDataPath) []driverSeasonalData {
 		}
 		name := htmlquery.InnerText(nameCell)
 		name = commons.Trim(name)
-		// fmt.Printf("\tDriver: %s\n", name)
-		cells := htmlquery.Find(row, "/td[position() > 1 and position() < last()]/text()[1]")
+		cells := htmlquery.Find(row, "/td[position() > 1 and position() < last()]")
 		if len(cells) < 10 {
 			log.Fatalf("Failed to find driver cells in %s", path)
 		}
@@ -145,10 +166,13 @@ func parseFile(dataPath wikiDataPath) []driverSeasonalData {
 			if dataPath.season == lastSeason && id > lastEventId {
 				break
 			}
-			resultText := htmlquery.InnerText(cell)
+			firstText := htmlquery.FindOne(cell, "./text()[1]")
+			resultText := htmlquery.InnerText(firstText)
 			resultText = commons.Trim(resultText)
 			resultText = strings.Replace(resultText, "†", "", 1)
+			poleNode := htmlquery.FindOne(cell, ".//sup[text() = 'P']")
 			position, err := commons.ParseInt(resultText)
+			pole := poleNode != nil
 			var driverResult driverRaceResult
 			if err == nil {
 				driverResult = driverRaceResult{
@@ -172,10 +196,10 @@ func parseFile(dataPath wikiDataPath) []driverSeasonalData {
 					id: id,
 					result: result, 
 					position: 0,
+					pole: pole,
 				}
 			}
 			races = append(races, driverResult)
-			// fmt.Printf("\t\tResult: %s\n", resultText)
 		}
 		driver := driverSeasonalData{
 			name: name,
@@ -186,78 +210,96 @@ func parseFile(dataPath wikiDataPath) []driverSeasonalData {
 	return drivers
 }
 
-func getFeatures(drivers []driverSeasonalData) ([][]float64, []float64) {
+func getFeatures(drivers []driverSeasonalData) ([][]float64, []float64, []featureMetaData) {
 	features := [][]float64{}
 	labels := []float64{}
+	metaData := []featureMetaData{}
 	for _, driver := range drivers {
 		for i, race := range driver.races {
-			if i < featureRaces {
+			if i < minSeasonRaces {
 				continue
 			}
-			multiSeason := false
-			bestPosition := 20
-			podiumFinishes := 0
-			retired := false
-			disqualified := false
-			for j := 1; j <= featureRaces; j++ {
+			wins := 0
+			second := 0
+			podiums := 0
+			poleFails := 0
+			samples := 0
+			j := 1
+			for i >= j {
 				previousRace := driver.races[i - j]
 				if previousRace.season != race.season {
-					multiSeason = true
 					break
 				}
-				switch previousRace.result {
-				case resultPosition:
-					position := previousRace.position
-					if position <= 3 {
-						podiumFinishes++
-					}
-					bestPosition = min(bestPosition, position)
-				case resultRetired:
-					retired = true
-				case resultDisqualified:
-					disqualified = true
+				if previousRace.isWin() {
+					wins++
+					second++
+					podiums++
+				} else if previousRace.isPosition(2) {
+					second++
+					podiums++
+				} else if previousRace.isPosition(3) {
+					podiums++
 				}
+				if previousRace.pole && !previousRace.isWin() {
+					poleFails++
+				}
+				samples++
+				j++
 			}
-			if multiSeason {
+			if samples < minSeasonRaces {
 				continue
 			}
-			raceFeatures := []float64{0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0}
-			switch bestPosition {
-			case 1:
-				raceFeatures[0] = 1.0
-			case 2:
-				raceFeatures[1] = 1.0
-			case 3:
-				raceFeatures[2] = 1.0
-			case 4:
-				raceFeatures[3] = 1.0
+			winRate := float64(wins) / float64(samples)
+			secondRate := float64(second) / float64(samples)
+			podiumRate := float64(podiums) / float64(samples)
+			poleFailRate := float64(poleFails) / float64(samples)
+			previousRace := driver.races[i - 1]
+			previousRace2 := driver.races[i - 2]
+			recentWin1 := 0.0
+			if previousRace.isWin() {
+				recentWin1 = 1.0
 			}
-			if podiumFinishes >= 2 {
-				raceFeatures[4] = 1.0
-			} else if podiumFinishes == 1 {
-				raceFeatures[5] = 1.0
+			recentWin2 := 0.0
+			if previousRace2.isWin() {
+				recentWin2 = 1.0
 			}
-			if retired {
-				raceFeatures[6] = 1.0
+			retired := 0.0
+			if previousRace.result == resultRetired {
+				retired = 1.0
 			}
-			if disqualified {
-				raceFeatures[7] = 1.0
+			disqualified := 0.0
+			if previousRace.result == resultDisqualified {
+				disqualified = 1.0
 			}
-			var label float64
-			if race.result == resultPosition && race.position == 1 {
+			raceFeatures := []float64{
+				winRate,
+				secondRate,
+				podiumRate,
+				poleFailRate,
+				recentWin1,
+				recentWin2,
+				retired,
+				disqualified,
+			}
+			label := 0.0
+			if race.isWin() {
 				label = 1.0
-			} else {
-				label = 0.0
+			}
+			driverMetaData := featureMetaData{
+				driver: driver.name,
+				season: race.season,
+				id: race.id,
 			}
 			labels = append(labels, label)
 			features = append(features, raceFeatures)
+			metaData = append(metaData, driverMetaData)
 		}
 	}
-	return features, labels
+	return features, labels, metaData
 }
 
 func fitAndEvaluate(features [][]float64, labels []float64) {
-	model := linear.NewLogistic("Batch Gradient Ascent", 0.0001, 0, 1000, features, labels)
+	model := linear.NewLogistic(logisticMethod, alpha, regularization, maxIterations, features, labels)
 	err := model.Learn()
 	if err != nil {
 		log.Fatalf("Failed to train model: %v", err)
@@ -273,7 +315,7 @@ func fitAndEvaluate(features [][]float64, labels []float64) {
 		if err != nil {
 			log.Fatalf("Failed to make predictions: %v", err)
 		}
-		prediction := predictionVector[0] > 0.5
+		prediction := predictionVector[0] > classThreshold
 		if label {
 			if prediction {
 				truePositives++
@@ -294,11 +336,78 @@ func fitAndEvaluate(features [][]float64, labels []float64) {
 		percentage := 100.0 * float64(count) / float64(total)
 		fmt.Printf("%s: %.1f%% (%d samples)\n", description, percentage, count)
 	}
+	positiveTerm := float64(truePositives) / (float64(truePositives) + float64(falseNegatives))
+	negativeTerm := float64(trueNegatives) / (float64(trueNegatives) + float64(falsePositives))
+	youdensJ := positiveTerm + negativeTerm - 1.0
 	f1Score := 2.0 * float64(truePositives) / (2.0 * float64(truePositives) + float64(falsePositives) + float64(falseNegatives))
 	printRatio("True positives", truePositives)
 	printRatio("True negatives", trueNegatives)
 	printRatio("False positives", falsePositives)
 	printRatio("False negatives", falseNegatives)
 	printRatio("True labels", positiveLabels)
-	fmt.Printf("F1 score: %.3f", f1Score)
+	fmt.Printf("Youden's J: %.3f\n", youdensJ)
+	fmt.Printf("F1 score: %.3f\n", f1Score)
+}
+
+func makePredictions(features [][]float64, labels []float64, metaData []featureMetaData) {
+	predictionData := []driverPredictionData{}
+	for i, currentFeatures := range features {
+		label := labels[i]
+		currentMetaData := metaData[i]
+		currentPredictionData := driverPredictionData{
+			features: currentFeatures,
+			label: label,
+			metaData: currentMetaData,
+		}
+		predictionData = append(predictionData, currentPredictionData)
+	}
+	slices.SortFunc(predictionData, func (a, b driverPredictionData) int {
+		meta1 := a.metaData
+		meta2 := b.metaData
+		if meta1.season != meta2.season {
+			return cmp.Compare(meta1.season, meta2.season)
+		}
+		return cmp.Compare(meta1.id, meta2.id)
+	})
+	for id := predictionsId; true; id++ {
+		i := slices.IndexFunc(predictionData, func (f driverPredictionData) bool {
+			return f.metaData.season == predictionsSeason && f.metaData.id == id
+		})
+		if i == -1 {
+			break
+		}
+		trainingFeatures := [][]float64{}
+		trainingLabels := []float64{}
+		for _, currentPredictionData := range predictionData[:i] {
+			trainingFeatures = append(trainingFeatures, currentPredictionData.features)
+			trainingLabels = append(trainingLabels, currentPredictionData.label)
+		}
+		model := linear.NewLogistic(logisticMethod, alpha, regularization, maxIterations, trainingFeatures, trainingLabels)
+		model.Output = io.Discard
+		err := model.Learn()
+		if err != nil {
+			log.Fatalf("Failed to train model: %v", err)
+		}
+		for j := i; j < len(predictionData); j++ {
+			currentPredictionData := predictionData[j]
+			currentMetaData := currentPredictionData.metaData
+			if currentMetaData.season != predictionsSeason || currentMetaData.id != id {
+				break
+			}
+			predictionVector, err := model.Predict(currentPredictionData.features)
+			if err != nil {
+				log.Fatalf("Failed to make prediction: %v", err)
+			}
+			prediction := predictionVector[0]
+			fmt.Printf("Season = %d, event ID = %d, driver = %s: %.3f\n", currentMetaData.season, currentMetaData.id, currentMetaData.driver, prediction)
+		}
+	}
+}
+
+func (r *driverRaceResult) isWin() bool {
+	return r.isPosition(1)
+}
+
+func (r *driverRaceResult) isPosition(position int) bool {
+	return r.result == resultPosition && r.position == position
 }
