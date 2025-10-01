@@ -16,18 +16,19 @@ import (
 
 const (
 	dataDirectory = "data"
-	firstSeason = 2015
+	firstSeason = 2020
 	lastSeason = 2025
-	lastEventId = 17
+	lastEventID = 17
 	driverLimit = 6
 	raceWindowSize = 10
-	classThreshold = 0.38
+	classThreshold = 0.40
 	logisticMethod = "Batch Gradient Ascent"
 	alpha = 0.0001
 	regularization = 0
 	maxIterations = 1000
-	predictionsSeason = 2025
+	predictionsSeason = 2024
 	predictionsId = raceWindowSize + 1
+	enableMultiSeason = false
 )
 
 type raceResult int
@@ -77,7 +78,7 @@ func performRegression(predictions bool) {
 	if !predictions {
 		fitAndEvaluate(features, labels)
 	} else {
-		makePredictions(features, labels, metaData)
+		makePredictions(features, labels, metaData, drivers)
 	}
 }
 
@@ -167,7 +168,7 @@ func parseFile(dataPath wikiDataPath) []driverSeasonalData {
 		races := []driverRaceResult{}
 		for j, cell := range cells {
 			id := j + 1
-			if dataPath.season == lastSeason && id > lastEventId {
+			if dataPath.season == lastSeason && id > lastEventID {
 				break
 			}
 			firstText := htmlquery.FindOne(cell, "./text()[1]")
@@ -227,53 +228,13 @@ func getFeatures(drivers []driverSeasonalData) ([][]float64, []float64, []featur
 				if k < raceWindowSize {
 					continue
 				}
-				getMatchingRace := func (race driverRaceResult) (driverRaceResult, bool) {
-					matchingRace, exists := commons.Find(driver2.races, func (r driverRaceResult) bool {
-						return r.season == race.season && r.id == race.id
-					})
-					return matchingRace, exists
-				}
-				race2, exists := getMatchingRace(race1)
+				race2, exists := getMatchingRace(driver2, race1)
 				if !exists {
 					continue
 				}
-				position12 := 0
-				position10 := 0
-				position20 := 0
-				retired := 0
-				missingRace := false
-				for l := 1; l <= raceWindowSize; l++ {
-					windowRace1 := driver1.races[k - l]
-					windowRace2, exists := getMatchingRace(windowRace1)
-					if !exists {
-						missingRace = true
-						break
-					}
-					r1p1 := windowRace1.isPosition(1)
-					r1p2 := windowRace1.isPosition(2)
-					r1p0 := !r1p1 && !r1p2
-					r2p1 := windowRace2.isPosition(1)
-					r2p2 := windowRace2.isPosition(2)
-					r2p0 := !r2p1 && !r2p2
-					if (r1p1 && r2p2) || (r2p1 && r1p2) {
-						position12++
-					} else if (r1p1 && r2p0) || (r2p1 && r1p0) {
-						position10++
-					} else if (r1p2 && r2p0) || (r2p2 && r1p0) {
-						position20++
-					}
-					if windowRace1.result == resultRetired || windowRace2.result == resultRetired {
-						retired++
-					}
-				}
-				if missingRace {
+				raceFeatures := getRaceFeatures(driver1, driver2, k)
+				if raceFeatures == nil {
 					continue
-				}
-				raceFeatures := []float64{
-					float64(position12),
-					float64(position10),
-					float64(position20),
-					float64(retired),
 				}
 				label := 0.0
 				if race1.isWin() || race2.isWin() {
@@ -292,6 +253,113 @@ func getFeatures(drivers []driverSeasonalData) ([][]float64, []float64, []featur
 		}
 	}
 	return features, labels, metaData
+}
+
+func getRaceFeatures(
+	driver1 driverSeasonalData,
+	driver2 driverSeasonalData,
+	k int,
+) []float64 {
+	return getSimpleFeatures(driver1, driver2, k)
+	// return getComboFeatures(driver1, driver2, k)
+}
+
+func getSimpleFeatures(
+	driver1 driverSeasonalData,
+	driver2 driverSeasonalData,
+	k int,
+) []float64 {
+	firstRace := driver1.races[k - 1]
+	lastRace := driver1.races[k - raceWindowSize]
+	if !enableMultiSeason && firstRace.season != lastRace.season {
+		return nil
+	}
+	wins := 0
+	secondPlace := 0
+	wonLastRace := 0.0
+	for l := 1; l <= raceWindowSize; l++ {
+		windowRace1 := driver1.races[k - l]
+		windowRace2, exists := getMatchingRace(driver2, windowRace1)
+		if !exists {
+			return nil
+		}
+		if windowRace1.isWin() || windowRace2.isWin() {
+			if l == 1 {
+				wonLastRace = 1.0
+			} else {
+				wins++
+			}
+		}
+		if windowRace1.isPosition(2) || windowRace2.isPosition(2) {
+			secondPlace++
+		}
+	}
+	features := []float64{
+		float64(wins),
+		float64(secondPlace),
+		wonLastRace,
+	}
+	return features
+}
+
+func getComboFeatures(
+	driver1 driverSeasonalData,
+	driver2 driverSeasonalData,
+	k int,
+) []float64 {
+	position12 := 0
+	position10 := 0
+	position20 := 0
+	retired := 0
+	wonLastRace := 0.0
+	firstRace := driver1.races[k - 1]
+	lastRace := driver1.races[k - raceWindowSize]
+	if !enableMultiSeason && firstRace.season != lastRace.season {
+		return nil
+	}
+	for l := 1; l <= raceWindowSize; l++ {
+		windowRace1 := driver1.races[k - l]
+		windowRace2, exists := getMatchingRace(driver2, windowRace1)
+		if !exists {
+			return nil
+		}
+		r1p1 := windowRace1.isPosition(1)
+		r1p2 := windowRace1.isPosition(2)
+		r1p0 := !r1p1 && !r1p2
+		r2p1 := windowRace2.isPosition(1)
+		r2p2 := windowRace2.isPosition(2)
+		r2p0 := !r2p1 && !r2p2
+		if (r1p1 && r2p2) || (r2p1 && r1p2) {
+			position12++
+		} else if (r1p1 && r2p0) || (r2p1 && r1p0) {
+			position10++
+		} else if (r1p2 && r2p0) || (r2p2 && r1p0) {
+			position20++
+		}
+		if windowRace1.result == resultRetired || windowRace2.result == resultRetired {
+			retired++
+		}
+		if windowRace1.isWin() || windowRace2.isWin() {
+			wonLastRace = 1.0
+		} else {
+			wonLastRace = 0.0
+		}
+	}
+	features := []float64{
+		float64(position12),
+		float64(position10),
+		float64(position20),
+		float64(retired),
+		float64(wonLastRace),
+	}
+	return features
+}
+
+func getMatchingRace(driver2 driverSeasonalData, race driverRaceResult) (driverRaceResult, bool) {
+	matchingRace, exists := commons.Find(driver2.races, func (r driverRaceResult) bool {
+		return r.season == race.season && r.id == race.id
+	})
+	return matchingRace, exists
 }
 
 func fitAndEvaluate(features [][]float64, labels []float64) {
@@ -345,7 +413,7 @@ func fitAndEvaluate(features [][]float64, labels []float64) {
 	fmt.Printf("F1 score: %.3f\n", f1Score)
 }
 
-func makePredictions(features [][]float64, labels []float64, metaData []featureMetaData) {
+func makePredictions(features [][]float64, labels []float64, metaData []featureMetaData, drivers []driverSeasonalData) {
 	predictionData := []driverPredictionData{}
 	for i, currentFeatures := range features {
 		label := labels[i]
@@ -365,6 +433,7 @@ func makePredictions(features [][]float64, labels []float64, metaData []featureM
 		}
 		return cmp.Compare(meta1.id, meta2.id)
 	})
+	var model *linear.Logistic
 	for id := predictionsId; true; id++ {
 		i := slices.IndexFunc(predictionData, func (f driverPredictionData) bool {
 			return f.metaData.season == predictionsSeason && f.metaData.id == id
@@ -378,7 +447,7 @@ func makePredictions(features [][]float64, labels []float64, metaData []featureM
 			trainingFeatures = append(trainingFeatures, currentPredictionData.features)
 			trainingLabels = append(trainingLabels, currentPredictionData.label)
 		}
-		model := linear.NewLogistic(logisticMethod, alpha, regularization, maxIterations, trainingFeatures, trainingLabels)
+		model = linear.NewLogistic(logisticMethod, alpha, regularization, maxIterations, trainingFeatures, trainingLabels)
 		model.Output = io.Discard
 		err := model.Learn()
 		if err != nil {
@@ -390,15 +459,62 @@ func makePredictions(features [][]float64, labels []float64, metaData []featureM
 			if currentMetaData.season != predictionsSeason || currentMetaData.id != id {
 				break
 			}
-			predictionVector, err := model.Predict(currentPredictionData.features)
-			if err != nil {
-				log.Fatalf("Failed to make prediction: %v", err)
-			}
-			prediction := predictionVector[0]
-			format := "Season = %d, event ID = %d, driver 1 = %s, driver 2 = %s: %.3f\n"
-			fmt.Printf(format, currentMetaData.season, currentMetaData.id, currentMetaData.driver1, currentMetaData.driver2, prediction)
+			printPrediction(
+				currentMetaData.season,
+				currentMetaData.id,
+				currentMetaData.driver1,
+				currentMetaData.driver2,
+				currentPredictionData.features,
+				model,
+			)
 		}
 	}
+	fmt.Printf("\nPrediction for upcoming race:\n")
+	for i, driver1 := range drivers {
+		for j, driver2 := range drivers {
+			if i >= j {
+				continue
+			}
+			for k, race1 := range driver1.races {
+				if race1.season != lastSeason || race1.id != lastEventID {
+					continue
+				}
+				_, exists := getMatchingRace(driver2, race1)
+				if !exists {
+					continue
+				}
+				raceFeatures := getRaceFeatures(driver1, driver2, k + 1)
+				if raceFeatures == nil {
+					continue
+				}
+				printPrediction(
+					lastSeason,
+					lastEventID + 1,
+					driver1.name,
+					driver2.name,
+					raceFeatures,
+					model,
+				)
+			}
+		}
+	}
+}
+
+func printPrediction(
+	season int,
+	eventID int,
+	driver1 string,
+	driver2 string,
+	features []float64,
+	model *linear.Logistic,
+) {
+	predictionVector, err := model.Predict(features)
+	if err != nil {
+		log.Fatalf("Failed to make prediction: %v", err)
+	}
+	prediction := predictionVector[0]
+	format := "Season = %d, event ID = %d, driver 1 = %s, driver 2 = %s: %.3f\n"
+	fmt.Printf(format, season, eventID, driver1, driver2, prediction)
 }
 
 func (r *driverRaceResult) isWin() bool {
