@@ -16,18 +16,18 @@ import (
 
 const (
 	dataDirectory = "data"
-	firstSeason = 2020
+	firstSeason = 2015
 	lastSeason = 2025
 	lastEventId = 17
 	driverLimit = 6
-	minSeasonRaces = 5
-	classThreshold = 0.31
+	raceWindowSize = 10
+	classThreshold = 0.38
 	logisticMethod = "Batch Gradient Ascent"
 	alpha = 0.0001
 	regularization = 0
 	maxIterations = 1000
 	predictionsSeason = 2025
-	predictionsId = minSeasonRaces + 1
+	predictionsId = raceWindowSize + 1
 )
 
 type raceResult int
@@ -58,7 +58,8 @@ type driverRaceResult struct {
 }
 
 type featureMetaData struct {
-	driver string
+	driver1 string
+	driver2 string
 	season int
 	id int
 }
@@ -69,12 +70,15 @@ type driverPredictionData struct {
 	metaData featureMetaData
 }
 
-func performRegression() {
+func performRegression(predictions bool) {
 	paths := downloadFiles()
 	drivers := parseFiles(paths)
 	features, labels, metaData := getFeatures(drivers)
-	// fitAndEvaluate(features, labels)
-	makePredictions(features, labels, metaData)
+	if !predictions {
+		fitAndEvaluate(features, labels)
+	} else {
+		makePredictions(features, labels, metaData)
+	}
 }
 
 func downloadFiles() []wikiDataPath {
@@ -214,85 +218,77 @@ func getFeatures(drivers []driverSeasonalData) ([][]float64, []float64, []featur
 	features := [][]float64{}
 	labels := []float64{}
 	metaData := []featureMetaData{}
-	for _, driver := range drivers {
-		for i, race := range driver.races {
-			if i < minSeasonRaces {
+	for i, driver1 := range drivers {
+		for j, driver2 := range drivers {
+			if i >= j {
 				continue
 			}
-			wins := 0
-			second := 0
-			podiums := 0
-			poleFails := 0
-			samples := 0
-			j := 1
-			for i >= j {
-				previousRace := driver.races[i - j]
-				if previousRace.season != race.season {
-					break
+			for k, race1 := range driver1.races {
+				if k < raceWindowSize {
+					continue
 				}
-				if previousRace.isWin() {
-					wins++
-					second++
-					podiums++
-				} else if previousRace.isPosition(2) {
-					second++
-					podiums++
-				} else if previousRace.isPosition(3) {
-					podiums++
+				getMatchingRace := func (race driverRaceResult) (driverRaceResult, bool) {
+					matchingRace, exists := commons.Find(driver2.races, func (r driverRaceResult) bool {
+						return r.season == race.season && r.id == race.id
+					})
+					return matchingRace, exists
 				}
-				if previousRace.pole && !previousRace.isWin() {
-					poleFails++
+				race2, exists := getMatchingRace(race1)
+				if !exists {
+					continue
 				}
-				samples++
-				j++
+				position12 := 0
+				position10 := 0
+				position20 := 0
+				retired := 0
+				missingRace := false
+				for l := 1; l <= raceWindowSize; l++ {
+					windowRace1 := driver1.races[k - l]
+					windowRace2, exists := getMatchingRace(windowRace1)
+					if !exists {
+						missingRace = true
+						break
+					}
+					r1p1 := windowRace1.isPosition(1)
+					r1p2 := windowRace1.isPosition(2)
+					r1p0 := !r1p1 && !r1p2
+					r2p1 := windowRace2.isPosition(1)
+					r2p2 := windowRace2.isPosition(2)
+					r2p0 := !r2p1 && !r2p2
+					if (r1p1 && r2p2) || (r2p1 && r1p2) {
+						position12++
+					} else if (r1p1 && r2p0) || (r2p1 && r1p0) {
+						position10++
+					} else if (r1p2 && r2p0) || (r2p2 && r1p0) {
+						position20++
+					}
+					if windowRace1.result == resultRetired || windowRace2.result == resultRetired {
+						retired++
+					}
+				}
+				if missingRace {
+					continue
+				}
+				raceFeatures := []float64{
+					float64(position12),
+					float64(position10),
+					float64(position20),
+					float64(retired),
+				}
+				label := 0.0
+				if race1.isWin() || race2.isWin() {
+					label = 1.0
+				}
+				driverMetaData := featureMetaData{
+					driver1: driver1.name,
+					driver2: driver2.name,
+					season: race1.season,
+					id: race1.id,
+				}
+				labels = append(labels, label)
+				features = append(features, raceFeatures)
+				metaData = append(metaData, driverMetaData)
 			}
-			if samples < minSeasonRaces {
-				continue
-			}
-			winRate := float64(wins) / float64(samples)
-			secondRate := float64(second) / float64(samples)
-			podiumRate := float64(podiums) / float64(samples)
-			poleFailRate := float64(poleFails) / float64(samples)
-			previousRace := driver.races[i - 1]
-			previousRace2 := driver.races[i - 2]
-			recentWin1 := 0.0
-			if previousRace.isWin() {
-				recentWin1 = 1.0
-			}
-			recentWin2 := 0.0
-			if previousRace2.isWin() {
-				recentWin2 = 1.0
-			}
-			retired := 0.0
-			if previousRace.result == resultRetired {
-				retired = 1.0
-			}
-			disqualified := 0.0
-			if previousRace.result == resultDisqualified {
-				disqualified = 1.0
-			}
-			raceFeatures := []float64{
-				winRate,
-				secondRate,
-				podiumRate,
-				poleFailRate,
-				recentWin1,
-				recentWin2,
-				retired,
-				disqualified,
-			}
-			label := 0.0
-			if race.isWin() {
-				label = 1.0
-			}
-			driverMetaData := featureMetaData{
-				driver: driver.name,
-				season: race.season,
-				id: race.id,
-			}
-			labels = append(labels, label)
-			features = append(features, raceFeatures)
-			metaData = append(metaData, driverMetaData)
 		}
 	}
 	return features, labels, metaData
@@ -399,7 +395,8 @@ func makePredictions(features [][]float64, labels []float64, metaData []featureM
 				log.Fatalf("Failed to make prediction: %v", err)
 			}
 			prediction := predictionVector[0]
-			fmt.Printf("Season = %d, event ID = %d, driver = %s: %.3f\n", currentMetaData.season, currentMetaData.id, currentMetaData.driver, prediction)
+			format := "Season = %d, event ID = %d, driver 1 = %s, driver 2 = %s: %.3f\n"
+			fmt.Printf(format, currentMetaData.season, currentMetaData.id, currentMetaData.driver1, currentMetaData.driver2, prediction)
 		}
 	}
 }
